@@ -1223,10 +1223,10 @@ __device__ static void mb_compute_observations(Env* env, obs_t* observations, in
         mb_put(obs_extra, 24, (reward->distance == 0) ? 0 : 1);
         mb_put(obs_extra, 25, (reward->tower == 0) ? 0 : 1);
 
-        // Same (overlapping) tile layout as moba.h: write order matters.
+        // 4 slots per cell: tile, hp, mana, level (same layout as moba.h)
         for (int dy = -vis; dy <= vis; dy++) {
             for (int dx = -vis; dx <= vis; dx++) {
-                int map_idx = (dy + vis)*11 + (dx + vis);
+                int map_idx = 4*((dy + vis)*11 + (dx + vis));
                 int adr = mb_offset(y + dy, x + dx);
                 if (!mb_in_map(adr))
                     continue;

@@ -505,7 +505,8 @@ void compute_observations(MOBA* env) {
                 int ob_x = dx + vis;
                 int ob_y = dy + vis;
 
-                int map_idx = ob_y*11 + ob_x;
+                // 4 slots per cell: tile, hp, mana, level
+                int map_idx = 4*(ob_y*11 + ob_x);
 
                 int adr = map_offset(map, yy, xx);
                 int tile = map->grid[adr];
