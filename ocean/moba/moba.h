@@ -328,24 +328,32 @@ int bfs(Map *map, unsigned char *flat_paths, int* flat_buffer, int dest_r, int d
     return 0;
 }
 
+// Only walls block bfs and walls never change, so every env shares one table.
+// Entries left at 255 are unreachable from the destination.
 unsigned char* precompute_pathing(Map* map){
     int N = map->width;
-    unsigned char* paths = (unsigned char*)calloc(N*N*N*N, 1);
-    int* buffer = (int*)calloc(3*8*N*N, sizeof(int));
-    for (int r = 0; r < N; r++) {
-        for (int c = 0; c < N; c++) {
-            for (int rr = 0; rr < N; rr++) {
-                for (int cc = 0; cc < N; cc++) {
-                    int adr = ai_offset(r, c, rr, cc);
-                    paths[adr] = 255;
-                }
-            }
-            int adr = ai_offset(r, c, 0, 0);
-            bfs(map, &paths[adr], buffer, r, c);
+    unsigned char* paths = (unsigned char*)malloc((size_t)N*N*N*N);
+    memset(paths, 255, (size_t)N*N*N*N);
+    #pragma omp parallel
+    {
+        int* buffer = (int*)calloc(3*8*N*N, sizeof(int));
+        #pragma omp for schedule(dynamic, 16)
+        for (int dst = 0; dst < N*N; dst++) {
+            int r = dst / N;
+            int c = dst % N;
+            bfs(map, &paths[ai_offset(r, c, 0, 0)], buffer, r, c);
         }
+        free(buffer);
     }
     return paths;
 }
+
+// Native builds precompute the full table once (many envs, many threads).
+// Web runs one env, so it fills lazily instead of paying the startup cost.
+static unsigned char* moba_shared_paths = NULL;
+static int* moba_shared_path_buffer = NULL;
+static int moba_paths_complete = 0;
+static int moba_paths_refs = 0;
 
 struct Env {
     GameRenderer* client;
@@ -590,8 +598,8 @@ int move_towards(MOBA* env, Entity* entity, int y_dst, int x_dst, float speed) {
     int adr = ai_offset(y_dst, x_dst, y_src, x_src);
     int atn = env->ai_paths[adr];
 
-    // Compute path if not cached
-    if (atn == 255) {
+    // Compute path if not cached (web only; native tables are complete)
+    if (atn == 255 && !moba_paths_complete) {
         int bfs_adr = ai_offset(y_dst, x_dst, 0, 0);
         bfs(env->map, &env->ai_paths[bfs_adr], env->ai_path_buffer, y_dst, x_dst);
         atn = env->ai_paths[adr];
@@ -2444,8 +2452,13 @@ void puf_close(MOBA* env) {
     free(env->orig_grid);
     free(env->path_rng->rng);
     free(env->path_rng);
-    free(env->ai_path_buffer);
-    free(env->ai_paths);
+    if (--moba_paths_refs == 0) {
+        free(moba_shared_paths);
+        free(moba_shared_path_buffer);
+        moba_shared_paths = NULL;
+        moba_shared_path_buffer = NULL;
+        moba_paths_complete = 0;
+    }
 }
 
 void puf_init(Env* env, Dict* kwargs) {
@@ -2461,15 +2474,20 @@ void puf_init(Env* env, Dict* kwargs) {
         fprintf(stderr, "moba: too many agents\n");
         exit(1);
     }
-    // Shared path cache is large; allocate once per env for standalone puf path.
-    // (vec path previously shared one across envs — optional optimization later.)
-    if (env->ai_paths == NULL) {
-        env->ai_paths = (unsigned char*)calloc(128ull*128*128*128, sizeof(unsigned char));
-        for (size_t i = 0; i < 128ull*128*128*128; i++) env->ai_paths[i] = 255;
+    if (moba_shared_paths == NULL) {
+#ifdef PLATFORM_WEB
+        moba_shared_paths = (unsigned char*)malloc(128ull*128*128*128);
+        memset(moba_shared_paths, 255, 128ull*128*128*128);
+        moba_shared_path_buffer = (int*)calloc(3*8*128*128, sizeof(int));
+#else
+        Map static_map = {game_map_npy, NULL, 128, 128};
+        moba_shared_paths = precompute_pathing(&static_map);
+        moba_paths_complete = 1;
+#endif
     }
-    if (env->ai_path_buffer == NULL) {
-        env->ai_path_buffer = (int*)calloc(3*8*128*128, sizeof(int));
-    }
+    moba_paths_refs++;
+    env->ai_paths = moba_shared_paths;
+    env->ai_path_buffer = moba_shared_path_buffer;
     for (int i = 0; i < env->num_agents; i++) {
         env->agents[i].policy = 0;
         env->agents[i].action_mask = NULL;
