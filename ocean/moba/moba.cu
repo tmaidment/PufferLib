@@ -1,10 +1,17 @@
-// CUDA Moba — standalone env source for --cu builds. Prototype port of moba.h:
-// one thread per env, game logic kept serial and in the same order as the CPU
-// version. Differences from moba.h:
+// CUDA Moba — standalone env source for --cu builds. Port of moba.h with one
+// warp per env: lane 0 runs the game logic serially in the CPU order, and the
+// mbw_* warp-collective functions spread scans, nearest-target search,
+// observations, per-tick clears and resets across the 32 lanes. Results are
+// bit-identical to running the same logic on a single thread.
+// Differences from moba.h:
 //   - per-env xorshift RNG instead of the process-wide rand()
 //   - skill function pointers replaced by a switch on hero type
 //   - scanned target lists store entity indices instead of Entity*
 //   - out-of-map reads/writes are guarded (UB on CPU, a fault on GPU)
+//   - state is packed to keep more of it in L2 (the step is bound by scattered
+//     memory accesses): byte pids and scan lists, the tile grid derived from
+//     pids plus a wall bitmap, 96-byte entities with narrowed ints, and
+//     moba.h's render-only entity fields (last_x/y, target_pid, ...) dropped
 //   - debug printf/exit paths dropped; rendering is a minimal map view
 #ifndef PUFFER_MOBA_GPU_CU
 #define PUFFER_MOBA_GPU_CU
@@ -62,7 +69,9 @@ typedef __nv_bfloat16 obs_t;
 // overrun 121 entries spill into the next row exactly as they do on CPU.
 #define SCAN_ROWS 256
 #define SCAN_COLS 121
-#define MOBA_BLOCK 64
+#ifndef MOBA_BLOCK
+#define MOBA_BLOCK 128 // 4 envs (warps) per block; must be a multiple of 32
+#endif
 
 struct Log {
     float perf;
@@ -140,48 +149,46 @@ typedef struct PlayerLog {
     float usage_e;
 } PlayerLog;
 
+// 96 bytes, fields read every tick first (two 32-byte sectors). Small ints are
+// narrowed; every value stays far inside its type. moba.h's render-only fields
+// (last_x/y, attack_aoe, target_pid, tier, reward) are dropped: the kernel
+// never reads them.
 typedef struct Entity {
-    int pid;
-    int entity_type;
-    int hero_type;
-    int grid_id;
-    int team;
+    float y;
+    float x;
     float health;
     float max_health;
     float mana;
     float max_mana;
-    float y;
-    float x;
+    float damage;
+    float move_modifier;
+    short pid;
+    short stun_timer;
+    short move_timer;
+    short q_timer;
+    short w_timer;
+    short e_timer;
+    short basic_attack_timer;
+    short basic_attack_cd;
+    short level;
+    unsigned char entity_type;
+    unsigned char team;
+    unsigned char grid_id;
+    unsigned char is_hit;
+    int xp;
+    unsigned char hero_type;
+    unsigned char lane;
+    unsigned char waypoint;
+    short xp_on_kill;
+    short hp_gain_per_level;
+    short mana_gain_per_level;
+    short damage_gain_per_level;
     float spawn_y;
     float spawn_x;
-    float damage;
-    int lane;
-    int waypoint;
     float move_speed;
-    float move_modifier;
-    int stun_timer;
-    int move_timer;
-    int q_timer;
-    int w_timer;
-    int e_timer;
-    int basic_attack_timer;
-    int basic_attack_cd;
-    int is_hit;
-    int level;
-    int xp;
-    int xp_on_kill;
-    float reward;
-    int tier;
     float base_health;
     float base_mana;
     float base_damage;
-    int hp_gain_per_level;
-    int mana_gain_per_level;
-    int damage_gain_per_level;
-    float last_x;
-    float last_y;
-    int target_pid;
-    int attack_aoe;
 } Entity;
 
 typedef struct Reward {
@@ -206,9 +213,14 @@ typedef struct Env {
     Entity entities[NUM_ENTITIES];
     Reward reward_components[NUM_PLAYERS];
     PlayerLog player_logs[NUM_PLAYERS];
-    unsigned char grid[MAP_CELLS];
-    short pids[MAP_CELLS];
-    short scanned[SCAN_ROWS * SCAN_COLS];
+    // Map occupancy: entity index per cell, PID_NONE when empty. moba.h's tile
+    // grid is derived (mb_tile): the occupant's grid_id, else WALL or EMPTY
+    // from walls, the static map's walls minus any later written EMPTY. Byte
+    // pids and scan lists roughly halve per-env state, which keeps more of it
+    // in L2 (the step kernel is bound by scattered DRAM accesses).
+    unsigned char pids[MAP_CELLS];
+    unsigned int walls[MAP_CELLS / 32];
+    unsigned char scanned[SCAN_ROWS * SCAN_COLS]; // lists end at SCAN_END
 } Env;
 
 typedef struct MobaConfig {
@@ -221,7 +233,7 @@ typedef struct MobaConfig {
     float reward_distance;
     float reward_tower;
     const unsigned char* paths;     // shared 128^4 next-step table
-    const unsigned char* orig_grid; // static map
+    const unsigned int* orig_walls; // static map walls, 1 bit per cell
 } MobaConfig;
 
 __constant__ MobaConfig d_mcfg;
@@ -273,8 +285,33 @@ __device__ static inline float mb_l1(float x1, float y1, float x2, float y2) {
     return fabsf(x1 - x2) + fabsf(y1 - y2);
 }
 
-__device__ static inline short* mb_scan_row(Env* env, int pid) {
+__device__ static inline unsigned char* mb_scan_row(Env* env, int pid) {
     return &env->scanned[pid * SCAN_COLS];
+}
+
+#define PID_NONE 255
+#define SCAN_END 255
+
+// Occupant of a cell, -1 if none.
+__device__ static inline int mb_pid_at(const Env* env, int adr) {
+    int pid = env->pids[adr];
+    return (pid == PID_NONE) ? -1 : pid;
+}
+
+__device__ static inline bool mb_is_wall(const Env* env, int adr) {
+    return (env->walls[adr >> 5] >> (adr & 31)) & 1;
+}
+
+// moba.h's grid[adr] == EMPTY
+__device__ static inline bool mb_cell_empty(const Env* env, int adr) {
+    return env->pids[adr] == PID_NONE && !mb_is_wall(env, adr);
+}
+
+// moba.h's grid[adr] = EMPTY; pids[adr] = -1 (which also erases a wall)
+__device__ static inline void mb_clear_cell(Env* env, int adr) {
+    env->pids[adr] = PID_NONE;
+    if (mb_is_wall(env, adr))
+        env->walls[adr >> 5] &= ~(1u << (adr & 31));
 }
 
 __device__ static inline int mb_calc_level(int xp) {
@@ -294,14 +331,13 @@ __device__ static int mb_move_to(Env* env, Entity* player, float dest_y, float d
     if (!mb_in_map(dst))
         return 1;
 
-    if (env->grid[dst] != EMPTY && env->pids[dst] != player->pid)
+    // Blocked unless the cell is empty or already ours
+    int occupant = env->pids[dst];
+    if (occupant == PID_NONE ? mb_is_wall(env, dst) : occupant != player->pid)
         return 1;
 
-    if (mb_in_map(src)) {
-        env->grid[src] = EMPTY;
-        env->pids[src] = -1;
-    }
-    env->grid[dst] = player->grid_id;
+    if (mb_in_map(src))
+        mb_clear_cell(env, src);
     env->pids[dst] = player->pid;
 
     player->y = dest_y;
@@ -349,15 +385,10 @@ __device__ static void mb_kill_entity(Env* env, Entity* entity) {
     if (entity->pid == -1)
         return;
     int adr = mb_offset((int)entity->y, (int)entity->x);
-    if (mb_in_map(adr)) {
-        env->grid[adr] = EMPTY;
-        env->pids[adr] = -1;
-    }
+    if (mb_in_map(adr))
+        mb_clear_cell(env, adr);
     entity->pid = -1;
-    entity->target_pid = -1;
     entity->health = 0;
-    entity->last_x = 0;
-    entity->last_y = 0;
     entity->x = 0;
     entity->y = 0;
 }
@@ -380,7 +411,6 @@ __device__ static void mb_spawn_player(Env* env, Entity* entity) {
     entity->q_timer = 0;
     entity->w_timer = 0;
     entity->e_timer = 0;
-    entity->target_pid = -1;
     entity->waypoint = 1;
 
     int y, x;
@@ -388,11 +418,9 @@ __device__ static void mb_spawn_player(Env* env, Entity* entity) {
         y = entity->spawn_y + mb_rand(env)%15 - 7;
         x = entity->spawn_x + mb_rand(env)%15 - 7;
         int adr = mb_offset(y, x);
-        if (mb_in_map(adr) && env->grid[adr] == EMPTY)
+        if (mb_in_map(adr) && mb_cell_empty(env, adr))
             break;
     }
-    entity->last_x = x;
-    entity->last_y = y;
     mb_move_to(env, entity, y, x);
 }
 
@@ -418,7 +446,6 @@ __device__ static int mb_attack(Env* env, Entity* player, Entity* target, float 
         player_log->damage_dealt += damage;
         target_log->damage_received += damage;
         target->health -= damage;
-        player->target_pid = target->pid;
         target->is_hit = 1;
         return 0;
     }
@@ -566,14 +593,11 @@ __device__ static int mb_spawn_creep(Env* env, int idx, int lane) {
         y = spawn_y + mb_rand(env) % 7 - 3;
         x = spawn_x + mb_rand(env) % 7 - 3;
         int adr = mb_offset(y, x);
-        if (mb_in_map(adr) && env->grid[adr] == EMPTY)
+        if (mb_in_map(adr) && mb_cell_empty(env, adr))
             break;
     }
     creep->health = creep->max_health;
-    creep->target_pid = -1;
     creep->waypoint = 1;
-    creep->last_x = x;
-    creep->last_y = y;
     return mb_move_to(env, creep, y, x);
 }
 
@@ -583,7 +607,6 @@ __device__ static int mb_spawn_neutral(Env* env, int idx) {
     neutral->pid = pid;
     neutral->health = neutral->max_health;
     neutral->basic_attack_timer = 0;
-    neutral->target_pid = -1;
 
     int y, x;
     int spawn_y = (int)neutral->spawn_y;
@@ -592,11 +615,9 @@ __device__ static int mb_spawn_neutral(Env* env, int idx) {
         y = spawn_y + mb_rand(env) % 7 - 3;
         x = spawn_x + mb_rand(env) % 7 - 3;
         int adr = mb_offset(y, x);
-        if (mb_in_map(adr) && env->grid[adr] == EMPTY)
+        if (mb_in_map(adr) && mb_cell_empty(env, adr))
             break;
     }
-    neutral->last_x = x;
-    neutral->last_y = y;
     return mb_move_to(env, neutral, y, x);
 }
 
@@ -606,7 +627,7 @@ __device__ static int mb_scan_aoe(Env* env, Entity* player, int radius,
     int player_y = player->y;
     int player_x = player->x;
     int player_team = player->team;
-    short* row = mb_scan_row(env, player->pid);
+    unsigned char* row = mb_scan_row(env, player->pid);
     int idx = 0;
 
     for (int y = player_y-radius; y <= player_y+radius; y++) {
@@ -614,7 +635,7 @@ __device__ static int mb_scan_aoe(Env* env, Entity* player, int radius,
             if (y < 0 || y >= MAP_N || x < 0 || x >= MAP_N)
                 continue;
 
-            int target_pid = env->pids[mb_offset(y, x)];
+            int target_pid = mb_pid_at(env, mb_offset(y, x));
             if (target_pid == -1)
                 continue;
 
@@ -638,37 +659,128 @@ __device__ static int mb_scan_aoe(Env* env, Entity* player, int radius,
             idx += 1;
         }
     }
-    row[idx] = -1;
+    row[idx] = SCAN_END;
     return (idx == 0) ? 1 : 0;
 }
 
-__device__ static Entity* mb_nearest_scanned_target(Env* env, Entity* player) {
-    Entity* nearest_target = NULL;
-    float nearest_dist = 9999999;
-    float player_y = player->y;
-    float player_x = player->x;
-    short* row = mb_scan_row(env, player->pid);
+// ---- warp-collective helpers ----
+// mbw_* functions are called by all 32 lanes of an env's warp with uniform
+// arguments. Each starts with __syncwarp() so lane 0's earlier stores are
+// visible to every lane before shared state is read.
 
-    for (int idx = 0; idx < SCAN_COLS; idx++) {
-        int tidx = row[idx];
-        if (tidx == -1)
-            break;
+#define FULL_MASK 0xffffffffu
 
-        Entity* target = &env->entities[tidx];
-        float dist = mb_l1(player_y, player_x, target->y, target->x);
-        if (dist < nearest_dist) {
-            nearest_target = target;
-            nearest_dist = dist;
+// mb_scan_aoe across lanes. Cells are numbered row-major over the square and
+// each 32-cell chunk is compacted with a ballot, so the list (including any
+// spill past SCAN_COLS) is written to exactly the slots the serial loop uses.
+// All pid loads, then all entity loads, are issued before any list store:
+// pids and the list are both bytes in Env, so interleaving them would make
+// every chunk a separate DRAM round trip.
+#define SCAN_MAX_RADIUS 7
+#define SCAN_MAX_CHUNKS (((2*SCAN_MAX_RADIUS + 1)*(2*SCAN_MAX_RADIUS + 1) + 31) / 32)
+__device__ static int mbw_scan_aoe(Env* env, Entity* player, int radius,
+        bool exclude_friendly, bool exclude_hostile, bool exclude_creeps,
+        bool exclude_neutrals, bool exclude_towers, int lane) {
+    __syncwarp();
+    int player_y = player->y;
+    int player_x = player->x;
+    int player_team = player->team;
+    unsigned char* row = mb_scan_row(env, player->pid);
+    int side = 2*radius + 1;
+    int cells = side*side;
+
+    int target_pids[SCAN_MAX_CHUNKS];
+    #pragma unroll
+    for (int chunk = 0; chunk < SCAN_MAX_CHUNKS; chunk++) {
+        int i = 32*chunk + lane;
+        target_pids[chunk] = -1;
+        if (i < cells) {
+            int y = player_y - radius + i / side;
+            int x = player_x - radius + i % side;
+            if (y >= 0 && y < MAP_N && x >= 0 && x < MAP_N)
+                target_pids[chunk] = mb_pid_at(env, mb_offset(y, x));
         }
     }
-    return nearest_target;
+
+    unsigned keep_bits = 0;
+    #pragma unroll
+    for (int chunk = 0; chunk < SCAN_MAX_CHUNKS; chunk++) {
+        int target_pid = target_pids[chunk];
+        if (target_pid == -1)
+            continue;
+        Entity* target = &env->entities[target_pid];
+        int target_team = target->team;
+        int target_type = target->entity_type;
+        bool keep = !(exclude_friendly && target_team == player_team)
+            && !(exclude_hostile && target_team != player_team)
+            && !(exclude_neutrals && target_type == ENTITY_NEUTRAL)
+            && !(exclude_creeps && target_type == ENTITY_CREEP)
+            && !(exclude_towers && target_type == ENTITY_TOWER);
+        keep_bits |= (unsigned)keep << chunk;
+    }
+
+    int count = 0;
+    #pragma unroll
+    for (int chunk = 0; chunk < SCAN_MAX_CHUNKS; chunk++) {
+        bool keep = (keep_bits >> chunk) & 1;
+        unsigned ballot = __ballot_sync(FULL_MASK, keep);
+        if (keep)
+            row[count + __popc(ballot & ((1u << lane) - 1))] = target_pids[chunk];
+        count += __popc(ballot);
+    }
+    if (lane == 0)
+        row[count] = SCAN_END;
+    __syncwarp();
+    return (count == 0) ? 1 : 0;
+}
+
+// Nearest entry of the player's scan list as a warp argmin. Ties go to the
+// earliest entry, matching the serial loop's strict '<'. Returns a pid or -1.
+__device__ static int mbw_nearest_scanned_target(Env* env, Entity* player, int lane) {
+    __syncwarp();
+    float player_y = player->y;
+    float player_x = player->x;
+    unsigned char* row = mb_scan_row(env, player->pid);
+    float best_dist = 9999999;
+    int best_idx = SCAN_COLS;
+    int best_pid = -1;
+
+    for (int base = 0; base < SCAN_COLS; base += 32) {
+        int i = base + lane;
+        int tidx = (i < SCAN_COLS && row[i] != SCAN_END) ? row[i] : -1;
+        unsigned end = __ballot_sync(FULL_MASK, tidx == -1);
+        bool valid = tidx != -1 && (end == 0 || lane < __ffs(end) - 1);
+        if (valid) {
+            Entity* target = &env->entities[tidx];
+            float dist = mb_l1(player_y, player_x, target->y, target->x);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_idx = i;
+                best_pid = tidx;
+            }
+        }
+        if (end != 0)
+            break;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        float dist = __shfl_xor_sync(FULL_MASK, best_dist, offset);
+        int idx = __shfl_xor_sync(FULL_MASK, best_idx, offset);
+        int pid = __shfl_xor_sync(FULL_MASK, best_pid, offset);
+        if (dist < best_dist || (dist == best_dist && idx < best_idx)) {
+            best_dist = dist;
+            best_idx = idx;
+            best_pid = pid;
+        }
+    }
+    return best_pid;
 }
 
 __device__ static void mb_aoe_scanned(Env* env, Entity* player, float damage, int stun) {
-    short* row = mb_scan_row(env, player->pid);
+    unsigned char* row = mb_scan_row(env, player->pid);
     for (int idx = 0; idx < SCAN_COLS; idx++) {
         int tidx = row[idx];
-        if (tidx == -1)
+        if (tidx == SCAN_END)
             break;
 
         Entity* target = &env->entities[tidx];
@@ -695,8 +807,6 @@ __device__ static int mb_player_aoe_attack(Env* env, Entity* player,
         return 1;
 
     mb_aoe_scanned(env, player, damage, stun);
-    player->target_pid = target->pid;
-    player->attack_aoe = radius;
     return 0;
 }
 
@@ -721,10 +831,10 @@ __device__ static int mb_pull(Env* env, Entity* player, Entity* target, float am
 __device__ static int mb_aoe_pull(Env* env, Entity* player, int radius, float amount) {
     mb_scan_aoe(env, player, radius, true, false, false, false, true);
     int err = 1;
-    short* row = mb_scan_row(env, player->pid);
+    unsigned char* row = mb_scan_row(env, player->pid);
     for (int idx = 0; idx < SCAN_COLS; idx++) {
         int tidx = row[idx];
-        if (tidx == -1)
+        if (tidx == SCAN_END)
             break;
 
         mb_pull(env, &env->entities[tidx], player, amount);
@@ -735,15 +845,20 @@ __device__ static int mb_aoe_pull(Env* env, Entity* player, int radius, float am
 
 // ---- AI ----
 
-__device__ static void mb_creep_ai(Env* env, Entity* creep) {
-    int waypoint = creep->waypoint;
-    int lane = creep->lane;
-
+// Warp-collective: lanes scan and pick the target, lane 0 acts.
+__device__ static void mbw_creep_ai(Env* env, Entity* creep, int lane) {
     if (env->tick % 5 == 0)
-        mb_scan_aoe(env, creep, CREEP_VISION, true, false, false, true, false);
+        mbw_scan_aoe(env, creep, CREEP_VISION, true, false, false, true, false, lane);
 
-    if (mb_scan_row(env, creep->pid)[0] != -1) {
-        Entity* target = mb_nearest_scanned_target(env, creep);
+    __syncwarp();
+    int target_pid = -1;
+    if (mb_scan_row(env, creep->pid)[0] != SCAN_END)
+        target_pid = mbw_nearest_scanned_target(env, creep, lane);
+    if (lane != 0)
+        return;
+
+    if (target_pid != -1) {
+        Entity* target = &env->entities[target_pid];
         float dest_y = target->y;
         float dest_x = target->x;
         float dist = mb_l1(creep->y, creep->x, dest_y, dest_x);
@@ -752,22 +867,32 @@ __device__ static void mb_creep_ai(Env* env, Entity* creep) {
 
         mb_move_towards(env, creep, dest_y, dest_x, d_mcfg.agent_speed);
     } else {
-        float dest_y = WAYPOINTS[lane][waypoint][0];
-        float dest_x = WAYPOINTS[lane][waypoint][1];
+        int waypoint = creep->waypoint;
+        int creep_lane = creep->lane;
+        float dest_y = WAYPOINTS[creep_lane][waypoint][0];
+        float dest_x = WAYPOINTS[creep_lane][waypoint][1];
         mb_move_towards(env, creep, dest_y, dest_x, d_mcfg.agent_speed);
 
         float dist = mb_l1(creep->y, creep->x, dest_y, dest_x);
-        if (dist < 2 && creep->waypoint < WAYPOINTS_N[lane] - 1)
+        if (dist < 2 && creep->waypoint < WAYPOINTS_N[creep_lane] - 1)
             creep->waypoint += 1;
     }
 }
 
-__device__ static void mb_neutral_ai(Env* env, Entity* neutral) {
+// Warp-collective: lanes scan and pick the target, lane 0 acts.
+__device__ static void mbw_neutral_ai(Env* env, Entity* neutral, int lane) {
     if (env->tick % 5 == 0)
-        mb_scan_aoe(env, neutral, NEUTRAL_VISION, true, false, true, true, true);
+        mbw_scan_aoe(env, neutral, NEUTRAL_VISION, true, false, true, true, true, lane);
 
-    if (mb_scan_row(env, neutral->pid)[0] != -1) {
-        Entity* target = mb_nearest_scanned_target(env, neutral);
+    __syncwarp();
+    int target_pid = -1;
+    if (mb_scan_row(env, neutral->pid)[0] != SCAN_END)
+        target_pid = mbw_nearest_scanned_target(env, neutral, lane);
+    if (lane != 0)
+        return;
+
+    if (target_pid != -1) {
+        Entity* target = &env->entities[target_pid];
         if (mb_l1(neutral->y, neutral->x, target->y, target->x) < 2)
             mb_basic_attack(env, neutral, target);
         else
@@ -974,77 +1099,131 @@ __device__ static int mb_skill(Env* env, Entity* player, Entity* target, int slo
 
 // ---- per-tick systems ----
 
-__device__ static void mb_step_creeps(Env* env) {
+// -DMOBA_PROFILE: lane 0 accumulates clock64() per step phase into
+// mb_prof_cycles, printed by puf_close.
+#ifdef MOBA_PROFILE
+#define MB_PROF_PHASES 8
+__device__ unsigned long long mb_prof_cycles[MB_PROF_PHASES];
+#define MB_PROF_MARK(phase) do { if (lane == 0) { long long now = clock64(); \
+    atomicAdd(&mb_prof_cycles[phase], (unsigned long long)(now - prof_t)); prof_t = now; } } while (0)
+#define MB_PROF_START long long prof_t = clock64()
+#else
+#define MB_PROF_MARK(phase) do {} while (0)
+#define MB_PROF_START do {} while (0)
+#endif
+
+// The per-tick systems below are warp-collective. Every lane walks the entity
+// loops so skips stay warp-uniform; lane 0 makes all state changes and the
+// __syncwarp() at the top of each iteration publishes them.
+
+__device__ static void mbw_step_creeps(Env* env, int lane) {
     // Spawn wave
-    if (env->tick % 150 == 0) {
-        for (int lane = 0; lane < 6; lane++) {
+    if (lane == 0 && env->tick % 150 == 0) {
+        for (int creep_lane = 0; creep_lane < 6; creep_lane++) {
             for (int i = 0; i < 5; i++) {
                 int creep_pid = CREEP_OFFSET + env->creep_idx;
                 mb_kill_entity(env, &env->entities[creep_pid]);
-                mb_spawn_creep(env, env->creep_idx, lane);
+                mb_spawn_creep(env, env->creep_idx, creep_lane);
                 env->creep_idx = (env->creep_idx + 1) % NUM_CREEPS;
             }
         }
     }
     for (int idx = 0; idx < NUM_CREEPS; idx++) {
+        __syncwarp();
         Entity* creep = &env->entities[CREEP_OFFSET + idx];
         if (creep->pid == -1)
             continue;
 
-        mb_update_status(creep);
-        mb_update_cooldowns(creep);
+        if (lane == 0) {
+            mb_update_status(creep);
+            mb_update_cooldowns(creep);
+        }
+        __syncwarp();
         if (creep->stun_timer > 0)
             continue;
 
-        mb_creep_ai(env, creep);
+        mbw_creep_ai(env, creep, lane);
     }
 }
 
-__device__ static void mb_step_neutrals(Env* env) {
-    if (env->tick % 600 == 0) {
+// Neutral AI only targets players and moves itself, so no neutral changes
+// another neutral's pid, timers, scan row or position. That lets lanes run
+// every neutral's status update and idle test up front; the serial loop then
+// visits, in index order, only neutrals that scan this tick, hold a target or
+// are away from camp. The others would do nothing in mbw_neutral_ai.
+__device__ static void mbw_step_neutrals(Env* env, int lane) {
+    if (lane == 0 && env->tick % 600 == 0) {
         for (int camp = 0; camp < 18; camp++) {
             for (int neut = 0; neut < 4; neut++) {
                 mb_spawn_neutral(env, 4*camp + neut);
             }
         }
     }
-    for (int idx = 0; idx < NUM_NEUTRALS; idx++) {
-        Entity* neutral = &env->entities[NEUTRAL_OFFSET + idx];
-        if (neutral->pid == -1)
-            continue;
+    __syncwarp();
 
-        mb_update_status(neutral);
-        mb_update_cooldowns(neutral);
-        if (neutral->stun_timer > 0)
-            continue;
-
-        mb_neutral_ai(env, neutral);
+    bool scan_tick = env->tick % 5 == 0;
+    unsigned active[(NUM_NEUTRALS + 31) / 32];
+    for (int chunk = 0; chunk < (NUM_NEUTRALS + 31) / 32; chunk++) {
+        int idx = 32*chunk + lane;
+        bool act = false;
+        if (idx < NUM_NEUTRALS) {
+            Entity* neutral = &env->entities[NEUTRAL_OFFSET + idx];
+            if (neutral->pid != -1) {
+                mb_update_status(neutral);
+                mb_update_cooldowns(neutral);
+                act = neutral->stun_timer <= 0 && (scan_tick
+                    || mb_scan_row(env, neutral->pid)[0] != SCAN_END
+                    || mb_l1(neutral->y, neutral->x, neutral->spawn_y, neutral->spawn_x) > 2);
+            }
+        }
+        active[chunk] = __ballot_sync(FULL_MASK, act);
     }
+
+    for (int chunk = 0; chunk < (NUM_NEUTRALS + 31) / 32; chunk++) {
+        for (unsigned mask = active[chunk]; mask; mask &= mask - 1) {
+            int idx = 32*chunk + __ffs(mask) - 1;
+            mbw_neutral_ai(env, &env->entities[NEUTRAL_OFFSET + idx], lane);
+        }
+    }
+    __syncwarp();
 }
 
-__device__ static void mb_step_towers(Env* env) {
-    for (int idx = 0; idx < NUM_TOWERS; idx++) {
-        Entity* tower = &env->entities[TOWER_OFFSET + idx];
-        if (tower->pid == -1)
-            continue;
-
-        mb_update_cooldowns(tower);
-        if (tower->basic_attack_timer > 0)
-            continue;
-
-        if (env->tick % 3 == 0)
-            mb_scan_aoe(env, tower, TOWER_VISION, true, false, false, true, true);
-
-        Entity* target = mb_nearest_scanned_target(env, tower);
-        if (target != NULL)
-            mb_basic_attack(env, tower, target);
+// Towers only hit creeps and players, so lanes can run every tower's cooldown
+// update and skip test up front. A tower that neither scans this tick nor has
+// a list would find no target. A tower scan can at most spill a -1 into the
+// next tower's row[0], which only turns that tower's attack into a no-op, as
+// it would serially.
+__device__ static void mbw_step_towers(Env* env, int lane) {
+    __syncwarp();
+    bool scan_tick = env->tick % 3 == 0;
+    bool act = false;
+    if (lane < NUM_TOWERS) {
+        Entity* tower = &env->entities[TOWER_OFFSET + lane];
+        if (tower->pid != -1) {
+            mb_update_cooldowns(tower);
+            act = tower->basic_attack_timer <= 0
+                && (scan_tick || mb_scan_row(env, tower->pid)[0] != SCAN_END);
+        }
     }
+    unsigned active = __ballot_sync(FULL_MASK, act);
+
+    for (unsigned mask = active; mask; mask &= mask - 1) {
+        Entity* tower = &env->entities[TOWER_OFFSET + __ffs(mask) - 1];
+        if (scan_tick)
+            mbw_scan_aoe(env, tower, TOWER_VISION, true, false, false, true, true, lane);
+
+        int target_pid = mbw_nearest_scanned_target(env, tower, lane);
+        if (lane == 0 && target_pid != -1)
+            mb_basic_attack(env, tower, &env->entities[target_pid]);
+    }
+    __syncwarp();
 }
 
-__device__ static void mb_step_players(Env* env, const float* actions,
-        float* rewards, int agent_base) {
-    for (int pid = 0; pid < NUM_PLAYERS; pid++) {
-        Reward* reward = &env->reward_components[pid];
+__device__ static void mbw_step_players(Env* env, const float* actions,
+        float* rewards, int agent_base, int lane) {
+    __syncwarp();
+    if (lane < NUM_PLAYERS) {
+        Reward* reward = &env->reward_components[lane];
         reward->death = 0;
         reward->xp = 0;
         reward->distance = 0;
@@ -1052,68 +1231,80 @@ __device__ static void mb_step_players(Env* env, const float* actions,
     }
 
     for (int pid = 0; pid < NUM_PLAYERS; pid++) {
+        __syncwarp();
         Entity* player = &env->entities[pid];
         PlayerLog* log = &env->player_logs[pid];
         Reward* reward = &env->reward_components[pid];
 
-        if (player->mana < player->max_mana)
-            player->mana += 2;
-        if (player->mana > player->max_mana)
-            player->mana = player->max_mana;
-        if (player->health < player->max_health)
-            player->health += 2;
-        if (player->health > player->max_health)
-            player->health = player->max_health;
+        if (lane == 0) {
+            if (player->mana < player->max_mana)
+                player->mana += 2;
+            if (player->mana > player->max_mana)
+                player->mana = player->max_mana;
+            if (player->health < player->max_health)
+                player->health += 2;
+            if (player->health > player->max_health)
+                player->health = player->max_health;
 
-        mb_update_status(player);
-        mb_update_cooldowns(player);
+            mb_update_status(player);
+            mb_update_cooldowns(player);
+        }
+        __syncwarp();
 
         if (player->stun_timer > 0)
             continue;
 
         if (d_mcfg.script_opponents && pid >= 5) {
-            mb_creep_ai(env, player);
+            mbw_creep_ai(env, player, lane);
         } else {
             const float* atn = actions + (long)(agent_base + pid) * NUM_ATNS;
-            float vel_y = (atn[0] - 3.0f) / 3.0f;
-            float vel_x = (atn[1] - 3.0f) / 3.0f;
-            float mag = sqrtf(vel_y*vel_y + vel_x*vel_x);
-            if (mag > 1) {
-                vel_y /= mag;
-                vel_x /= mag;
-            }
-
             int attack_target = (int)atn[2];
-            bool use_q = (int)atn[3];
-            bool use_w = (int)atn[4];
-            bool use_e = (int)atn[5];
-
             if (attack_target == 1 || attack_target == 0) {
                 // Scan everything
-                mb_scan_aoe(env, player, d_mcfg.vision_range, true, false, false, false, false);
+                mbw_scan_aoe(env, player, d_mcfg.vision_range, true, false, false, false, false, lane);
             } else if (attack_target == 2) {
                 // Scan only heros and towers
-                mb_scan_aoe(env, player, d_mcfg.vision_range, true, false, true, true, false);
+                mbw_scan_aoe(env, player, d_mcfg.vision_range, true, false, true, true, false, lane);
             }
 
-            Entity* target = NULL;
-            if (mb_scan_row(env, pid)[0] != -1)
-                target = mb_nearest_scanned_target(env, player);
+            __syncwarp();
+            int target_pid = -1;
+            if (mb_scan_row(env, pid)[0] != SCAN_END)
+                target_pid = mbw_nearest_scanned_target(env, player, lane);
+            Entity* target = (target_pid == -1) ? NULL : &env->entities[target_pid];
 
-            if (use_q && player->q_timer <= 0 && mb_skill(env, player, target, 0) == 0) {
-                log->usage_q += 1;
-            } else if (use_w && player->w_timer <= 0 && mb_skill(env, player, target, 1) == 0) {
-                log->usage_w += 1;
-            } else if (use_e && player->e_timer <= 0 && mb_skill(env, player, target, 2) == 0) {
-                log->usage_e += 1;
-            } else if (target != NULL && mb_basic_attack(env, player, target) == 0) {
-                log->usage_auto += 1;
+            if (lane == 0) {
+                float vel_y = (atn[0] - 3.0f) / 3.0f;
+                float vel_x = (atn[1] - 3.0f) / 3.0f;
+                float mag = sqrtf(vel_y*vel_y + vel_x*vel_x);
+                if (mag > 1) {
+                    vel_y /= mag;
+                    vel_x /= mag;
+                }
+
+                bool use_q = (int)atn[3];
+                bool use_w = (int)atn[4];
+                bool use_e = (int)atn[5];
+
+                if (use_q && player->q_timer <= 0 && mb_skill(env, player, target, 0) == 0) {
+                    log->usage_q += 1;
+                } else if (use_w && player->w_timer <= 0 && mb_skill(env, player, target, 1) == 0) {
+                    log->usage_w += 1;
+                } else if (use_e && player->e_timer <= 0 && mb_skill(env, player, target, 2) == 0) {
+                    log->usage_e += 1;
+                } else if (target != NULL && mb_basic_attack(env, player, target) == 0) {
+                    log->usage_auto += 1;
+                }
+
+                float dest_y = player->y + player->move_modifier*d_mcfg.agent_speed*vel_y;
+                float dest_x = player->x + player->move_modifier*d_mcfg.agent_speed*vel_x;
+                mb_move_to(env, player, dest_y, dest_x);
             }
-
-            float dest_y = player->y + player->move_modifier*d_mcfg.agent_speed*vel_y;
-            float dest_x = player->x + player->move_modifier*d_mcfg.agent_speed*vel_x;
-            mb_move_to(env, player, dest_y, dest_x);
         }
+
+        __syncwarp();
+        if (lane != 0)
+            continue;
 
         float sum_reward = reward->death + reward->xp + reward->distance + reward->tower;
 
@@ -1126,6 +1317,7 @@ __device__ static void mb_step_players(Env* env, const float* actions,
         if (!d_mcfg.script_opponents || pid < 5)
             rewards[agent_base + pid] = sum_reward;
     }
+    __syncwarp();
 }
 
 __device__ static void mb_add_log(Env* env, float radiant_victory, float dire_victory) {
@@ -1185,82 +1377,106 @@ __device__ static inline void mb_put(obs_t* obs, int i, float v) {
     obs[i] = __float2bfloat16((float)(unsigned char)(int)v);
 }
 
-__device__ static void mb_compute_observations(Env* env, obs_t* observations, int agent_base) {
+// Warp-collective. Every slot is written exactly once (zeros included), so
+// no lane's zero fill can race another lane's value. Lanes take 11x11 cells
+// (4 slots each, written as two bf16 pairs) and lanes 0-25 the extra features.
+__device__ static void mbw_compute_observations(Env* env, obs_t* observations,
+        int agent_base, int lane) {
+    __syncwarp();
     int vis = d_mcfg.vision_range;
+    const __nv_bfloat16 zero = __float2bfloat16(0.0f);
     for (int pid = 0; pid < d_mcfg.num_agents; pid++) {
         obs_t* obs_map = observations + (long)(agent_base + pid) * OBS_SIZE;
-        for (int i = 0; i < OBS_SIZE; i++)
-            obs_map[i] = __float2bfloat16(0.0f);
         obs_t* obs_extra = obs_map + 11*11*4;
-
         Entity* player = &env->entities[pid];
-        Reward* reward = &env->reward_components[pid];
-
         int y = player->y;
         int x = player->x;
 
-        mb_put(obs_extra, 0, x);
-        mb_put(obs_extra, 1, y);
-        mb_put(obs_extra, 2, player->level);
-        mb_put(obs_extra, 3, 10*player->health/player->max_health);
-        mb_put(obs_extra, 4, 10*player->mana/player->max_mana);
-        mb_put(obs_extra, 5, player->damage / 50.0f);
-        mb_put(obs_extra, 6, player->move_speed);
-        mb_put(obs_extra, 7, player->move_modifier);
-        mb_put(obs_extra, 8, player->stun_timer);
-        mb_put(obs_extra, 9, player->move_timer);
-        mb_put(obs_extra, 10, player->q_timer);
-        mb_put(obs_extra, 11, player->w_timer);
-        mb_put(obs_extra, 12, player->e_timer);
-        mb_put(obs_extra, 13, player->basic_attack_timer);
-        mb_put(obs_extra, 14, player->basic_attack_cd);
-        mb_put(obs_extra, 15, player->is_hit);
-        mb_put(obs_extra, 16, player->team);
-        mb_put(obs_extra, 17 + player->hero_type, 1);
-
-        mb_put(obs_extra, 22, (reward->death == 0) ? 0 : 1);
-        mb_put(obs_extra, 23, (reward->xp == 0) ? 0 : 1);
-        mb_put(obs_extra, 24, (reward->distance == 0) ? 0 : 1);
-        mb_put(obs_extra, 25, (reward->tower == 0) ? 0 : 1);
-
         // 4 slots per cell: tile, hp, mana, level (same layout as moba.h)
-        for (int dy = -vis; dy <= vis; dy++) {
-            for (int dx = -vis; dx <= vis; dx++) {
-                int map_idx = 4*((dy + vis)*11 + (dx + vis));
-                int adr = mb_offset(y + dy, x + dx);
-                if (!mb_in_map(adr))
-                    continue;
-
-                mb_put(obs_map, map_idx, env->grid[adr]);
-                int target_pid = env->pids[adr];
-                if (target_pid == -1)
-                    continue;
-
-                Entity* target = &env->entities[target_pid];
-                mb_put(obs_map, map_idx+1, 10*target->health/target->max_health);
-                if (target->max_mana > 0) // Towers do not have mana
-                    mb_put(obs_map, map_idx+2, 10*target->mana/target->max_mana);
-                mb_put(obs_map, map_idx+3, target->level);
+        for (int cell = lane; cell < 11*11; cell += 32) {
+            int dy = cell / 11 - vis;
+            int dx = cell % 11 - vis;
+            obs_t v[4] = {zero, zero, zero, zero};
+            int adr = mb_offset(y + dy, x + dx);
+            if (dy <= vis && dx <= vis && mb_in_map(adr)) {
+                int target_pid = mb_pid_at(env, adr);
+                if (target_pid == -1) {
+                    mb_put(v, 0, mb_is_wall(env, adr) ? WALL : EMPTY);
+                } else {
+                    Entity* target = &env->entities[target_pid];
+                    mb_put(v, 0, target->grid_id);
+                    mb_put(v, 1, 10*target->health/target->max_health);
+                    if (target->max_mana > 0) // Towers do not have mana
+                        mb_put(v, 2, 10*target->mana/target->max_mana);
+                    mb_put(v, 3, target->level);
+                }
             }
+            __nv_bfloat162* dst = (__nv_bfloat162*)(obs_map + 4*cell);
+            dst[0] = __halves2bfloat162(v[0], v[1]);
+            dst[1] = __halves2bfloat162(v[2], v[3]);
         }
+
+        if (lane >= 26)
+            continue;
+        Reward* reward = &env->reward_components[pid];
+        float f = 0;
+        switch (lane) {
+        case 0: f = x; break;
+        case 1: f = y; break;
+        case 2: f = player->level; break;
+        case 3: f = 10*player->health/player->max_health; break;
+        case 4: f = 10*player->mana/player->max_mana; break;
+        case 5: f = player->damage / 50.0f; break;
+        case 6: f = player->move_speed; break;
+        case 7: f = player->move_modifier; break;
+        case 8: f = player->stun_timer; break;
+        case 9: f = player->move_timer; break;
+        case 10: f = player->q_timer; break;
+        case 11: f = player->w_timer; break;
+        case 12: f = player->e_timer; break;
+        case 13: f = player->basic_attack_timer; break;
+        case 14: f = player->basic_attack_cd; break;
+        case 15: f = player->is_hit; break;
+        case 16: f = player->team; break;
+        case 22: f = (reward->death == 0) ? 0 : 1; break;
+        case 23: f = (reward->xp == 0) ? 0 : 1; break;
+        case 24: f = (reward->distance == 0) ? 0 : 1; break;
+        case 25: f = (reward->tower == 0) ? 0 : 1; break;
+        default: f = (lane - 17 == player->hero_type) ? 1 : 0; break; // 17-21
+        }
+        mb_put(obs_extra, lane, f);
     }
 }
 
 // ---- init / reset / step ----
 
-__device__ static void mb_init_env(Env* env) {
+__device__ static void mb_init_entities(Env* env);
+
+// Warp-collective: every cell empty, walls from the static map.
+__device__ static void mbw_reset_map(Env* env, int lane) {
+    unsigned int* pids4 = (unsigned int*)env->pids;
+    for (int i = lane; i < MAP_CELLS / 4; i += 32)
+        pids4[i] = 0x01010101u * PID_NONE;
+    for (int i = lane; i < MAP_CELLS / 32; i += 32)
+        env->walls[i] = d_mcfg.orig_walls[i];
+}
+
+// Warp-collective: map and scan rows across lanes, entity setup on lane 0.
+__device__ static void mbw_init_env(Env* env, int lane) {
+    mbw_reset_map(env, lane);
+    for (int i = lane; i < SCAN_ROWS; i += 32) {
+        env->scanned[i*SCAN_COLS] = SCAN_END;
+        env->scanned[i*SCAN_COLS + 1] = SCAN_END;
+    }
+    if (lane == 0)
+        mb_init_entities(env);
+    __syncwarp();
+}
+
+__device__ static void mb_init_entities(Env* env) {
     env->creep_idx = 0;
     env->total_towers_taken = 0;
     env->total_levels_gained = 0;
-
-    for (int i = 0; i < MAP_CELLS; i++) {
-        env->grid[i] = d_mcfg.orig_grid[i];
-        env->pids[i] = -1;
-    }
-    for (int i = 0; i < SCAN_ROWS; i++) {
-        env->scanned[i*SCAN_COLS] = -1;
-        env->scanned[i*SCAN_COLS + 1] = -1;
-    }
 
     // hero_type order matches moba.h: support, assassin, burst, tank, carry
     const float base_health[5] = {500, 400, 400, 700, 300};
@@ -1285,8 +1501,6 @@ __device__ static void mb_init_env(Env* env) {
             player->move_speed = d_mcfg.agent_speed;
             player->basic_attack_cd = 8;
             player->base_damage = 50;
-            player->last_x = 0;
-            player->last_y = 0;
             player->grid_id = RADIANT_SUPPORT + h + team*5;
             player->hero_type = h;
             player->base_health = base_health[h];
@@ -1311,7 +1525,6 @@ __device__ static void mb_init_env(Env* env) {
         tower->y = 0;
         tower->max_health = TOWER_HEALTH[idx];
         tower->damage = TOWER_DAMAGE[idx];
-        tower->tier = TOWER_TIER[idx];
         tower->xp_on_kill = 0;
     }
 
@@ -1340,36 +1553,36 @@ __device__ static void mb_init_env(Env* env) {
     }
 }
 
-__device__ static void mb_reset_env(Env* env) {
-    env->tick = 0;
-
-    for (int i = 0; i < NUM_ENTITIES; i++) {
+// Warp-collective. Entity kills and the map reset are independent per entity
+// and per cell; respawns draw from the RNG so they stay serial on lane 0.
+__device__ static void mbw_reset_env(Env* env, int lane) {
+    __syncwarp();
+    for (int i = lane; i < NUM_ENTITIES; i += 32) {
         Entity* entity = &env->entities[i];
-        entity->target_pid = -1;
-        mb_scan_row(env, i)[0] = -1;
+        mb_scan_row(env, i)[0] = SCAN_END;
         mb_kill_entity(env, entity);
     }
+    __syncwarp();
 
-    for (int i = 0; i < MAP_CELLS; i++) {
-        env->grid[i] = d_mcfg.orig_grid[i];
-        env->pids[i] = -1;
-    }
+    mbw_reset_map(env, lane);
+    __syncwarp();
+    if (lane != 0)
+        return;
+
+    env->tick = 0;
 
     // Respawn towers
     for (int idx = 0; idx < NUM_TOWERS; idx++) {
         int pid = TOWER_OFFSET + idx;
         Entity* tower = &env->entities[pid];
-        tower->target_pid = -1;
         tower->pid = pid;
         tower->health = tower->max_health;
         tower->basic_attack_timer = 0;
         tower->x = 0;
         tower->y = 0;
         int adr = mb_offset(tower->spawn_y, tower->spawn_x);
-        env->grid[adr] = EMPTY;
+        mb_clear_cell(env, adr);
         mb_move_to(env, tower, tower->spawn_y, tower->spawn_x);
-        tower->last_x = tower->x;
-        tower->last_y = tower->y;
     }
 
     // Respawn agents
@@ -1377,29 +1590,37 @@ __device__ static void mb_reset_env(Env* env) {
         env->player_logs[i] = PlayerLog{};
         Entity* player = &env->entities[i];
         player->pid = i;
-        player->target_pid = -1;
         player->xp = 0;
         player->level = 1;
         mb_spawn_player(env, player);
     }
 }
 
-__device__ static void mb_step_env(Env* env, const float* actions,
-        float* rewards, int agent_base) {
-    for (int pid = 0; pid < NUM_ENTITIES; pid++) {
+// Warp-collective.
+__device__ static void mbw_step_env(Env* env, const float* actions,
+        float* rewards, int agent_base, int lane) {
+    MB_PROF_START;
+    for (int pid = lane; pid < NUM_ENTITIES; pid += 32) {
         Entity* entity = &env->entities[pid];
-        entity->target_pid = -1;
-        entity->attack_aoe = 0;
-        entity->last_x = entity->x;
-        entity->last_y = entity->y;
         entity->is_hit = 0;
     }
+    __syncwarp();
+    MB_PROF_MARK(0);
 
-    mb_step_neutrals(env);
-    mb_step_creeps(env);
-    mb_step_towers(env);
-    mb_step_players(env, actions, rewards, agent_base);
-    env->tick += 1;
+    mbw_step_neutrals(env, lane);
+    MB_PROF_MARK(1);
+    mbw_step_creeps(env, lane);
+    MB_PROF_MARK(2);
+    mbw_step_towers(env, lane);
+    MB_PROF_MARK(3);
+    mbw_step_players(env, actions, rewards, agent_base, lane);
+    __syncwarp();
+    MB_PROF_MARK(4);
+    // Every lane reads tick before lane 0 bumps it
+    int tick = env->tick;
+    __syncwarp();
+    if (lane == 0)
+        env->tick = tick + 1;
 
     float radiant_victory = 0;
     float dire_victory = 0;
@@ -1411,41 +1632,59 @@ __device__ static void mb_step_env(Env* env, const float* actions,
         dire_victory = 1;
 
     if (radiant_victory || dire_victory) {
-        mb_add_log(env, radiant_victory, dire_victory);
-        mb_reset_env(env);
+        __syncwarp();
+        if (lane == 0)
+            mb_add_log(env, radiant_victory, dire_victory);
+        mbw_reset_env(env, lane);
     }
+    MB_PROF_MARK(5);
+}
+
+// One warp per env. Blocks hold whole warps, so a warp past the end returns as
+// a unit and never strands a lane at a __syncwarp().
+__device__ static inline int mb_warp_env(int* lane) {
+    int thread = blockIdx.x * blockDim.x + threadIdx.x;
+    *lane = thread & 31;
+    return thread >> 5;
 }
 
 __global__ void mb_init_kernel(Env* envs, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane;
+    int i = mb_warp_env(&lane);
     if (i >= n)
         return;
-    mb_init_env(&envs[i]);
+    mbw_init_env(&envs[i], lane);
 }
 
 __global__ void mb_reset_kernel(Env* envs, obs_t* observations,
         float* rewards, float* terminals, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane;
+    int i = mb_warp_env(&lane);
     if (i >= n)
         return;
     int agent_base = i * d_mcfg.num_agents;
-    mb_reset_env(&envs[i]);
-    mb_compute_observations(&envs[i], observations, agent_base);
-    for (int a = 0; a < d_mcfg.num_agents; a++) {
-        rewards[agent_base + a] = 0.0f;
-        terminals[agent_base + a] = 0.0f;
+    mbw_reset_env(&envs[i], lane);
+    mbw_compute_observations(&envs[i], observations, agent_base, lane);
+    if (lane < d_mcfg.num_agents) {
+        rewards[agent_base + lane] = 0.0f;
+        terminals[agent_base + lane] = 0.0f;
     }
 }
 
 // moba.h never sets terminals (episodes reset internally), so neither do we.
 __global__ void mb_step_kernel(Env* __restrict__ envs, const float* __restrict__ actions,
         obs_t* __restrict__ observations, float* __restrict__ rewards, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane;
+    int i = mb_warp_env(&lane);
     if (i >= n)
         return;
     int agent_base = i * d_mcfg.num_agents;
-    mb_step_env(&envs[i], actions, rewards, agent_base);
-    mb_compute_observations(&envs[i], observations, agent_base);
+    mbw_step_env(&envs[i], actions, rewards, agent_base, lane);
+#ifdef MOBA_PROFILE
+    long long prof_t = clock64();
+#endif
+    mbw_compute_observations(&envs[i], observations, agent_base, lane);
+    MB_PROF_MARK(6);
 }
 
 // ---- host ----
@@ -1513,12 +1752,12 @@ static struct {
     float* terminals;
     cudaStream_t stream;
     unsigned char* d_paths;
-    unsigned char* d_grid;
+    unsigned int* d_walls;
     int window_open;
 } g_gpu;
 
 static int mb_grid(int n) {
-    return (n + MOBA_BLOCK - 1) / MOBA_BLOCK;
+    return (n*32 + MOBA_BLOCK - 1) / MOBA_BLOCK;
 }
 
 Env* puf_vec_create(int total_agents, Dict* env_kwargs,
@@ -1546,10 +1785,14 @@ Env* puf_vec_create(int total_agents, Dict* env_kwargs,
     cudaMalloc((void**)&g_gpu.d_paths, (size_t)MAP_CELLS * MAP_CELLS);
     cudaMemcpy(g_gpu.d_paths, h_paths, (size_t)MAP_CELLS * MAP_CELLS, cudaMemcpyHostToDevice);
     free(h_paths);
-    cudaMalloc((void**)&g_gpu.d_grid, MAP_CELLS);
-    cudaMemcpy(g_gpu.d_grid, game_map_npy, MAP_CELLS, cudaMemcpyHostToDevice);
+    unsigned int h_walls[MAP_CELLS / 32] = {0};
+    for (int i = 0; i < MAP_CELLS; i++)
+        if (game_map_npy[i] == WALL)
+            h_walls[i >> 5] |= 1u << (i & 31);
+    cudaMalloc((void**)&g_gpu.d_walls, sizeof(h_walls));
+    cudaMemcpy(g_gpu.d_walls, h_walls, sizeof(h_walls), cudaMemcpyHostToDevice);
     cfg.paths = g_gpu.d_paths;
-    cfg.orig_grid = g_gpu.d_grid;
+    cfg.orig_walls = g_gpu.d_walls;
     cudaMemcpyToSymbol(d_mcfg, &cfg, sizeof(cfg));
 
     int n = total_agents / cfg.num_agents;
@@ -1595,13 +1838,23 @@ void puf_step(Env* env) {
 }
 
 void puf_close(Env* env) {
+#ifdef MOBA_PROFILE
+    unsigned long long cycles[MB_PROF_PHASES];
+    cudaMemcpyFromSymbol(cycles, mb_prof_cycles, sizeof(cycles));
+    const char* names[] = {"clear", "neutrals", "creeps", "towers", "players", "end/reset", "obs", ""};
+    double total = 0;
+    for (int i = 0; i < 7; i++)
+        total += cycles[i];
+    for (int i = 0; i < 7; i++)
+        fprintf(stderr, "moba profile %-10s %5.1f%%\n", names[i], 100.0 * cycles[i] / total);
+#endif
     if (g_gpu.window_open) {
         CloseWindow();
         g_gpu.window_open = 0;
     }
     cudaFree(g_gpu.envs);
     cudaFree(g_gpu.d_paths);
-    cudaFree(g_gpu.d_grid);
+    cudaFree(g_gpu.d_walls);
     g_gpu.envs = NULL;
 }
 
@@ -1611,8 +1864,8 @@ void puf_render(Env* env) {
         return;
     if (g_gpu.stream)
         cudaStreamSynchronize(g_gpu.stream);
-    static unsigned char grid[MAP_CELLS];
-    cudaMemcpy(grid, (char*)g_gpu.envs + offsetof(Env, grid), MAP_CELLS, cudaMemcpyDeviceToHost);
+    static Env env0;
+    cudaMemcpy(&env0, g_gpu.envs, sizeof(Env), cudaMemcpyDeviceToHost);
 
     const int cell = 6;
     if (!g_gpu.window_open) {
@@ -1631,7 +1884,10 @@ void puf_render(Env* env) {
     ClearBackground(colors[0]);
     for (int y = 0; y < MAP_N; y++) {
         for (int x = 0; x < MAP_N; x++) {
-            int tile = grid[y*MAP_N + x];
+            int adr = y*MAP_N + x;
+            int pid = env0.pids[adr];
+            int tile = (pid != PID_NONE) ? env0.entities[pid].grid_id
+                : ((env0.walls[adr >> 5] >> (adr & 31)) & 1) ? WALL : EMPTY;
             if (tile == EMPTY)
                 continue;
             Color c = tile <= NEUTRAL ? colors[tile]
